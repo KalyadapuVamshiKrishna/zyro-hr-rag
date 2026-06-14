@@ -19,21 +19,22 @@ def initialize_rag_system():
     loader = PyPDFDirectoryLoader(CORPUS_PATH)
     documents = loader.load()
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=400)  # increased overlap for dense policy tables
+    # UPGRADE 1: Tighter chunking to prevent splintering tables/timelines
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1400, chunk_overlap=150)
     chunks = splitter.split_documents(documents)
 
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # UPGRADE 2: BAAI embeddings to catch the insurance and maternity details
+    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
     vectorstore = FAISS.from_documents(chunks, embeddings)
 
-    # Synced with notebook Cell 8: k=7, fetch_k=30
+    # UPGRADE 3: Pure similarity to prevent MMR from hiding duplicate-looking dates (like the 7th)
     retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 7, "fetch_k": 30}
+        search_type="similarity",
+        search_kwargs={"k": 10}
     )
 
     llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1, max_tokens=1024)
 
-    # Synced with notebook Cell 11
     oos_prompt = ChatPromptTemplate.from_template(
         """You are a security router for the HR help desk at Zyro Dynamics (also known as Acrux Dynamics — treat these as the same company).
 
@@ -64,15 +65,16 @@ Question: {question}
 Classification:"""
     )
 
-    # Synced with notebook Cell 10
+    # UPGRADE 4: Added the COMPLETENESS rule
     rag_prompt = ChatPromptTemplate.from_template(
         """You are an HR Assistant for this company. Answer the employee's question using ONLY the provided context below.
 
 ABSOLUTE RULES — violation means failure:
 1. COMPANY NAME: The company may appear as "Acrux Dynamics" or "Zyro Dynamics" in questions or context. These are THE SAME COMPANY. Never acknowledge, comment on, or mention any difference. Never write phrases like "I must correct", "the context refers to", "also referred to as", "not Acrux Dynamics", "not Zyro Dynamics". Simply answer as if there is one company.
 2. NO META-PHRASES: Never start with "According to", "Based on the context", "The context states", "Based on the provided". Jump directly to the answer.
-3. IF NOT IN CONTEXT: Say "This information is not available in the current HR policy documents." — nothing more.
-4. PRECISION: Use exact numbers, dates, ranges, and timelines from the context.
+3. COMPLETENESS: If a question asks for a timeline, steps, or multiple types of arrangements, list EVERY single stage, date, timeline step, and arrangement type mentioned in the context completely. Do not summarize, truncate, or omit any details.
+4. IF NOT IN CONTEXT: Say "This information is not available in the current HR policy documents." — nothing more.
+5. PRECISION: Use exact numbers, dates, ranges, and timelines from the context.
 
 Context:
 {context}
@@ -92,7 +94,9 @@ def ask_bot(question, oos_prompt, rag_prompt, llm, retriever):
     if "OUT_OF_SCOPE" in decision:
         return "I can only answer HR-related questions from Zyro Dynamics policy documents.", []
 
-    retrieved_docs = retriever.invoke(question)
+    # UPGRADE 5: Query expansion to bridge the Zyro/Acrux gap
+    retrieval_query = question.replace("Acrux Dynamics", "Zyro Dynamics / Acrux Dynamics")
+    retrieved_docs = retriever.invoke(retrieval_query)
     context_str = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
     rag_chain = rag_prompt | llm | StrOutputParser()
