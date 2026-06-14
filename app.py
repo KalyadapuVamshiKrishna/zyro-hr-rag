@@ -12,7 +12,7 @@ st.set_page_config(page_title="Zyro Dynamics HR Portal", page_icon="🚀", layou
 st.title("🚀 Zyro Dynamics HR Help Desk")
 st.markdown("Welcome to the internal HR assistant. Ask any question regarding company policies, benefits, guidelines, or leave procedures.")
 
-CORPUS_PATH = "/kaggle/input/zyro-dynamics-hr-corpus/"
+CORPUS_PATH = "./policy_docs"  # Ensure this path contains the PDF files with HR policies
 
 @st.cache_resource
 def initialize_rag_system():
