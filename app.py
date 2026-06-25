@@ -8,138 +8,136 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
 
-st.set_page_config(page_title="Zyro Dynamics HR Portal", page_icon="🚀", layout="centered")
-st.title("🚀 Zyro Dynamics HR Help Desk")
-st.markdown("Welcome to the internal HR assistant. Ask any question regarding company policies, benefits, guidelines, or leave procedures.")
+# 1. UI Configuration
+st.set_page_config(page_title="Zyro Dynamics HR Help Desk", page_icon="🏢", layout="centered")
+st.title("🏢 Zyro Dynamics HR Help Desk")
+st.markdown("Welcome! I am the official Zyro Dynamics HR assistant. Ask me about policies, leave, or benefits.")
 
-CORPUS_PATH = "./policies/"  # Ensure this path contains the PDF files with HR policies
-
-@st.cache_resource
-def initialize_rag_system():
-    loader = PyPDFDirectoryLoader(CORPUS_PATH)
+# 2. Cached RAG Initialization
+@st.cache_resource(show_spinner="Booting up HR Knowledge Base... (This takes a few seconds)")
+def init_rag():
+    # Fetch API key from Streamlit's secure secrets management
+    os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+    
+    # Define where the PDFs will live in the GitHub repo
+    corpus_path = "policies" if os.path.exists("policies") else "data" 
+    
+    # Load and Chunk
+    loader = PyPDFDirectoryLoader(corpus_path)
     documents = loader.load()
-
-    # UPGRADE 1: Tighter chunking to prevent splintering tables/timelines
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1400, chunk_overlap=150)
+    
+    if not documents:
+        return None, None
+        
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200, length_function=len)
     chunks = splitter.split_documents(documents)
-
-    # UPGRADE 2: BAAI embeddings to catch the insurance and maternity details
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
+    
+    # Embeddings & Vector Store
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-small-en-v1.5",
+        model_kwargs={'device': 'cpu'},
+        encode_kwargs={'normalize_embeddings': True}
+    )
     vectorstore = FAISS.from_documents(chunks, embeddings)
-
-    # UPGRADE 3: Pure similarity to prevent MMR from hiding duplicate-looking dates (like the 7th)
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 10}
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+    
+    # LLM
+    llm = ChatGroq(
+        model="qwen/qwen3-32b",
+        temperature=0,
+        max_tokens=512,
+        model_kwargs={"reasoning_format": "hidden"}
     )
+    
+    # Guardrail Prompt
+    template = """You are the official HR Help Desk Chatbot for Zyro Dynamics. 
+    Your job is to answer employee questions accurately using ONLY the provided context.
 
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1, max_tokens=1024)
+    CRITICAL GUARDRAILS & RULES:
+    1. If the context does not contain the answer, output EXACTLY: OUT_OF_SCOPE
+    2. If the question is about general knowledge, coding, or anything outside company HR policy, output EXACTLY: OUT_OF_SCOPE
+    3. TRAP AVOIDANCE: If the retrieved context is for "Acrux Dynamics", it is invalid. If no valid Zyro Dynamics context remains, output EXACTLY: OUT_OF_SCOPE
+    4. Do not guess or make up information. If you can answer it, be concise and professional.
 
-    oos_prompt = ChatPromptTemplate.from_template(
-        """You are a security router for the HR help desk at Zyro Dynamics (also known as Acrux Dynamics — treat these as the same company).
+    Context:
+    {context}
 
-Classify the question as IN_SCOPE or OUT_OF_SCOPE.
+    Question: {question}
 
-IN_SCOPE — HR/company policy topics:
-- Leave policies: Earned Leave, Sick Leave, Maternity Leave (accrual, carry-forward, eligibility)
-- Payroll: salary credit dates, payroll cut-off dates
-- Compensation: CTC ranges, bonus targets for internal grades (e.g. L4 Senior)
-- Health insurance: coverage details, who is covered, premiums
-- PIP (Performance Improvement Plan): triggers, duration, conditions
-- APR (Annual Performance Review): timelines, self-assessment, increment/promotion letters
-- WFH/hybrid work: eligibility, rules, types of arrangements
+    Answer:"""
+    
+    prompt = ChatPromptTemplate.from_template(template)
+    guardrail_chain = prompt | llm | StrOutputParser()
+    
+    return retriever, guardrail_chain
 
-OUT_OF_SCOPE — everything else:
-- Job applications, recruitment, hiring processes
-- ESOP, stock options, vesting schedules for new joiners
-- Company financials: revenue, profits, performance
-- Product features (AcruxCRM, Salesforce comparisons)
-- Other companies' policies (Zoho, Freshworks, etc.)
-- General knowledge, coding, math, jokes, world news
+# Initialize system
+retriever, guardrail_chain = init_rag()
 
-IMPORTANT: Questions asking about Acrux Dynamics HR policies are IN_SCOPE — treat Acrux Dynamics = Zyro Dynamics.
-
-Respond with EXACTLY one word — either IN_SCOPE or OUT_OF_SCOPE.
-
-Question: {question}
-Classification:"""
-    )
-
-    # UPGRADE 4: Added the COMPLETENESS rule
-    rag_prompt = ChatPromptTemplate.from_template(
-        """You are an HR Assistant for this company. Answer the employee's question using ONLY the provided context below.
-
-ABSOLUTE RULES — violation means failure:
-1. COMPANY NAME: The company may appear as "Acrux Dynamics" or "Zyro Dynamics" in questions or context. These are THE SAME COMPANY. Never acknowledge, comment on, or mention any difference. Never write phrases like "I must correct", "the context refers to", "also referred to as", "not Acrux Dynamics", "not Zyro Dynamics". Simply answer as if there is one company.
-2. NO META-PHRASES: Never start with "According to", "Based on the context", "The context states", "Based on the provided". Jump directly to the answer.
-3. COMPLETENESS: If a question asks for a timeline, steps, or multiple types of arrangements, list EVERY single stage, date, timeline step, and arrangement type mentioned in the context completely. Do not summarize, truncate, or omit any details.
-4. IF NOT IN CONTEXT: Say "This information is not available in the current HR policy documents." — nothing more.
-5. PRECISION: Use exact numbers, dates, ranges, and timelines from the context.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer:"""
-    )
-
-    return oos_prompt, rag_prompt, llm, retriever
-
-
-def ask_bot(question, oos_prompt, rag_prompt, llm, retriever):
-    classifier = oos_prompt | llm | StrOutputParser()
-    decision = classifier.invoke({"question": question}).strip().upper()
-
-    if "OUT_OF_SCOPE" in decision:
-        return "I can only answer HR-related questions from Zyro Dynamics policy documents.", []
-
-    # UPGRADE 5: Query expansion to bridge the Zyro/Acrux gap
-    retrieval_query = question.replace("Acrux Dynamics", "Zyro Dynamics / Acrux Dynamics")
-    retrieved_docs = retriever.invoke(retrieval_query)
-    context_str = "\n\n".join(doc.page_content for doc in retrieved_docs)
-
-    rag_chain = rag_prompt | llm | StrOutputParser()
-    answer = rag_chain.invoke({"context": context_str, "question": question})
-
-    return answer, retrieved_docs
-
-
-try:
-    oos_prompt, rag_prompt, llm, retriever = initialize_rag_system()
-except Exception as e:
-    st.error(f"Failed to initialize RAG pipeline. Error: {e}")
+if not retriever:
+    st.error("⚠️ Corpus not found. Please ensure the HR PDFs are in a folder named 'policies' or 'data' in your repository.")
     st.stop()
 
+# 3. Chat History Management
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "sources" in message and message["sources"]:
-            with st.expander("📚 Viewed Sources"):
-                for src in message["sources"]:
-                    st.caption(f"📍 {src}")
+# Render existing chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if "sources" in msg:
+            with st.expander("Sources Cited"):
+                for s in msg["sources"]:
+                    st.caption(f"📄 {s}")
 
-if user_query := st.chat_input("Ask about leaves, travel reimbursements, WFH rules..."):
+# 4. User Interaction
+user_input = st.chat_input("Ask your HR question here...")
+
+if user_input:
+    # Display user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.markdown(user_query)
-    st.session_state.messages.append({"role": "user", "content": user_query})
+        st.markdown(user_input)
 
+    # Display assistant processing
     with st.chat_message("assistant"):
-        response_placeholder = st.empty()
-        answer, docs = ask_bot(user_query, oos_prompt, rag_prompt, llm, retriever)
-        response_placeholder.markdown(answer)
+        with st.spinner("Reviewing Zyro Dynamics policies..."):
+            
+            # Retrieve documents
+            docs = retriever.invoke(user_input)
+            context_text = "\\n\\n".join(doc.page_content for doc in docs)
+            
+            # Extract clean source citations (File Name + Page Number)
+            unique_sources = set()
+            for d in docs:
+                file_name = os.path.basename(d.metadata.get('source', 'Unknown'))
+                page = d.metadata.get('page', 0) + 1  # Add 1 because LangChain pages are 0-indexed
+                unique_sources.add(f"{file_name} (Page {page})")
+            source_list = list(unique_sources)
 
-        sources_list = []
-        if docs:
-            sources_list = sorted(list(set([
-                os.path.basename(doc.metadata.get('source', 'Unknown Policy'))
-                for doc in docs
-            ])))
-            with st.expander("📚 Viewed Sources"):
-                for src in sources_list:
-                    st.caption(f"📍 {src}")
+            # Generate Answer
+            raw_response = guardrail_chain.invoke({"context": context_text, "question": user_input})
+            
+            # Apply Guardrails programmatically
+            REFUSAL_MESSAGE = "I can only answer HR-related questions from Zyro Dynamics policy documents."
+            
+            if "OUT_OF_SCOPE" in raw_response.upper() or "Acrux" in raw_response:
+                final_answer = REFUSAL_MESSAGE
+                sources_to_show = [] # Do not show sources if it's out of scope
+            else:
+                final_answer = raw_response.strip()
+                sources_to_show = source_list
+            
+            # Stream the output to the UI
+            st.markdown(final_answer)
+            if sources_to_show:
+                with st.expander("Sources Cited"):
+                    for s in sources_to_show:
+                        st.caption(f"📄 {s}")
 
-    st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources_list})
+    # Save to history
+    message_data = {"role": "assistant", "content": final_answer}
+    if sources_to_show:
+        message_data["sources"] = sources_to_show
+    st.session_state.messages.append(message_data)
