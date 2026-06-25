@@ -43,10 +43,10 @@ def init_rag():
     
     # LLM
     llm = ChatGroq(
-        model="qwen/qwen3-32b",
+        model="groq/llama3.3-70b-versatile",
         temperature=0,
         max_tokens=512,
-        model_kwargs={"reasoning_format": "hidden"}
+        reasoning_format="hidden"  
     )
     
     # Guardrail Prompt
