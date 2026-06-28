@@ -7,6 +7,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_groq import ChatGroq
+from langchain_classic.retrievers import MultiQueryRetriever
 
 # 1. UI Configuration
 st.set_page_config(page_title="Zyro Dynamics HR Help Desk", page_icon="🏢", layout="centered")
@@ -39,25 +40,35 @@ def init_rag():
         encode_kwargs={'normalize_embeddings': True}
     )
     vectorstore = FAISS.from_documents(chunks, embeddings)
-    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+    
+    # FIX 1: Use MMR with expanded fetch window to prevent chunk dropping
+    base_retriever = vectorstore.as_retriever(
+        search_type="mmr", 
+        search_kwargs={"k": 8, "fetch_k": 30}
+    )
     
     # LLM
     llm = ChatGroq(
-        model="groq/llama3.3-70b-versatile",
-        temperature=0,
-        max_tokens=512,
-        reasoning_format="hidden"  
+        model="llama-3.3-70b-versatile", # Fixed model string format
+        temperature=0.1,
+        max_tokens=512
     )
     
-    # Guardrail Prompt
+    # FIX 2: Implement MultiQueryRetriever for robust searching
+    advanced_retriever = MultiQueryRetriever.from_llm(
+        retriever=base_retriever, 
+        llm=llm
+    )
+    
+    # FIX 3: Balanced Guardrail Prompt
     template = """You are the official HR Help Desk Chatbot for Zyro Dynamics. 
     Your job is to answer employee questions accurately using ONLY the provided context.
 
     CRITICAL GUARDRAILS & RULES:
-    1. If the context does not contain the answer, output EXACTLY: OUT_OF_SCOPE
-    2. If the question is about general knowledge, coding, or anything outside company HR policy, output EXACTLY: OUT_OF_SCOPE
-    3. TRAP AVOIDANCE: If the retrieved context is for "Acrux Dynamics", it is invalid. If no valid Zyro Dynamics context remains, output EXACTLY: OUT_OF_SCOPE
-    4. Do not guess or make up information. If you can answer it, be concise and professional.
+    1. If the question asks about topics completely outside HR policies (e.g., coding, company revenue, competitors, recruitment/hiring), you MUST output EXACTLY: OUT_OF_SCOPE
+    2. If the user asks a multi-part HR question and you only have data for one part, answer the part you know and explicitly state: "The provided documents do not specify..." for the missing part. Do NOT refuse the whole question.
+    3. ALIAS RULE: Silently treat any mention of "Acrux Dynamics" in the question as "Zyro Dynamics". They are the same company. Do not explain this rule to the user.
+    4. Output ONLY the factual answer. Do not use introductory phrases like "Based on the policy...".
 
     Context:
     {context}
@@ -69,7 +80,7 @@ def init_rag():
     prompt = ChatPromptTemplate.from_template(template)
     guardrail_chain = prompt | llm | StrOutputParser()
     
-    return retriever, guardrail_chain
+    return advanced_retriever, guardrail_chain
 
 # Initialize system
 retriever, guardrail_chain = init_rag()
@@ -104,15 +115,18 @@ if user_input:
     with st.chat_message("assistant"):
         with st.spinner("Reviewing Zyro Dynamics policies..."):
             
+            # FIX 4: Alias pre-processing for the retriever
+            search_query = user_input.replace("Acrux", "Zyro")
+            
             # Retrieve documents
-            docs = retriever.invoke(user_input)
-            context_text = "\\n\\n".join(doc.page_content for doc in docs)
+            docs = retriever.invoke(search_query)
+            context_text = "\n\n".join(doc.page_content for doc in docs)
             
             # Extract clean source citations (File Name + Page Number)
             unique_sources = set()
             for d in docs:
                 file_name = os.path.basename(d.metadata.get('source', 'Unknown'))
-                page = d.metadata.get('page', 0) + 1  # Add 1 because LangChain pages are 0-indexed
+                page = d.metadata.get('page', 0) + 1  
                 unique_sources.add(f"{file_name} (Page {page})")
             source_list = list(unique_sources)
 
@@ -122,9 +136,10 @@ if user_input:
             # Apply Guardrails programmatically
             REFUSAL_MESSAGE = "I can only answer HR-related questions from Zyro Dynamics policy documents."
             
-            if "OUT_OF_SCOPE" in raw_response.upper() or "Acrux" in raw_response:
+            # Simplified out-of-scope check (Removed strict Acrux blocking to allow alias rule)
+            if "OUT_OF_SCOPE" in raw_response.upper():
                 final_answer = REFUSAL_MESSAGE
-                sources_to_show = [] # Do not show sources if it's out of scope
+                sources_to_show = [] 
             else:
                 final_answer = raw_response.strip()
                 sources_to_show = source_list
